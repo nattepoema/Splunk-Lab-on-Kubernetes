@@ -1,3 +1,17 @@
+| Component | Versie | Opmerking |
+|---|---|---|
+| AlmaLinux | 10.x (laatste point-release) | RHEL 10-compatibel; wordt door RKE2 als gevalideerd OS vermeld |
+| RKE2 | v1.34.x (kanaal `v1.34`) | Hoogste Kubernetes-minor die Splunk Operator 3.1.0 ondersteunt |
+| Splunk Operator | 3.1.0 | Ondersteunt Kubernetes 1.25 – 1.34 |
+| Splunk Enterprise image | `splunk/splunk:10.4.3` | Vereist voor K8s 1.34 (10.0.4+ of 10.4+) |
+| local-path-provisioner | v0.0.36 | Dynamische PersistentVolumes op lokale disk |
+| Docker Engine | laatste `docker-ce` uit de officiële repo | |
+| Portainer CE | `portainer/portainer-ce:lts` | Beheert Docker én (optioneel) het RKE2-cluster |
+
+> **Ontwerpkeuze — twee container-runtimes op één host.** RKE2 gebruikt zijn eigen ingebouwde containerd (`/var/lib/rancher/rke2`) en raakt Docker niet aan. Docker Engine draait er los naast, met Portainer als web-UI. Beide gebruiken verschillende netwerken (Docker: `172.17.0.0/16`, RKE2: pods `10.42.0.0/16`, services `10.43.0.0/16`), dus er is geen overlap.
+
+---
+
 ## Inhoud
 
 0. Overzicht en planning van resources
@@ -6,7 +20,7 @@
 3. RKE2 (Kubernetes) installeren
 4. Storage: local-path-provisioner
 5. Splunk Operator installeren
-6. Splunk-cluster uitrollen (ClusterManager, 3 indexers, SearchHeadCluster, Monitoring Console)
+6. Splunk-cluster uitrollen (ClusterManager, 3 indexers, Standalone search head, Monitoring Console)
 7. Toegang tot Splunk Web
 8. Docker Engine installeren
 9. Portainer CE installeren
@@ -28,8 +42,7 @@ AlmaLinux 10 (bare metal)
 │   │   ├── splunk-operator-controller-manager
 │   │   ├── splunk-cm-cluster-manager-0
 │   │   ├── splunk-idx-indexer-0/1/2
-│   │   ├── splunk-shc-deployer-0
-│   │   ├── splunk-shc-search-head-0/1/2
+│   │   ├── splunk-sh-standalone-0          (search head)
 │   │   └── splunk-mc-monitoring-console-0
 │   ├── namespace local-path-storage
 │   └── (optioneel) namespace portainer  → Portainer Kubernetes-agent
@@ -42,19 +55,18 @@ AlmaLinux 10 (bare metal)
 | Onderdeel | Aantal | RAM-limiet per pod | Totaal |
 |---|---|---|---|
 | Indexers | 3 | 8 Gi | 24 Gi |
-| Search heads | 3 | 4 Gi | 12 Gi |
+| Search head (Standalone) | 1 | 4 Gi | 4 Gi |
 | Cluster Manager | 1 | 3 Gi | 3 Gi |
-| Deployer | 1 | 2 Gi | 2 Gi |
 | Monitoring Console | 1 | 2 Gi | 2 Gi |
 | Splunk Operator | 1 | ~0,5 Gi | 0,5 Gi |
 | RKE2 control plane + Canal + ingress | – | – | ~4 Gi |
 | Docker + Portainer | – | – | ~1 Gi |
 | OS + marge | – | – | ~15 Gi |
-| **Totaal** | | | **~64 Gi** |
+| **Totaal** | | | **~54 Gi** |
 
-Dit is krap maar werkbaar voor een lab. Wil je meer lucht, dan is de eenvoudigste besparing: de SearchHeadCluster (3 SH + deployer = 14 Gi) vervangen door één `Standalone` search head met `clusterManagerRef` (4 Gi). Beide varianten staan in hoofdstuk 6.
+Dat laat ~10 GB ruimte over. De search-laag is bewust één `Standalone` search head met `clusterManagerRef` (4 Gi) in plaats van een SearchHeadCluster (3 search heads + deployer, ~14 Gi): op één fysieke node voegt een SHC geen echte redundantie toe, maar kost wel veel geheugen. Wil je later toch een SHC oefenen, dan kun je de `Standalone` vervangen door een `SearchHeadCluster`-CR met dezelfde `clusterManagerRef`.
 
-### 0.3 Disk-indeling (2 TB)
+### 0.3 Disk-indeling (4 TB)
 
 Aanbevolen partitionering tijdens de installatie (LVM, XFS):
 
@@ -63,9 +75,9 @@ Aanbevolen partitionering tijdens de installatie (LVM, XFS):
 | `/boot` | 1 GB | |
 | `/boot/efi` | 600 MB | (bij UEFI) |
 | `/` | 100 GB | OS, `/opt`, `/usr` |
-| `/var/lib/rancher` | 200 GB | RKE2, containerd-images, etcd |
-| `/var/lib/docker` | 100 GB | Docker-images en -volumes |
-| `/opt/local-path-provisioner` | rest (~1,5 TB) | PersistentVolumes voor Splunk |
+| `/var/lib/rancher` | 250 GB | RKE2, containerd-images, etcd |
+| `/var/lib/docker` | 150 GB | Docker-images en -volumes |
+| `/opt/local-path-provisioner` | rest (~3,4 TB) | PersistentVolumes voor Splunk |
 | swap | geen | Kubernetes vereist swap uit |
 
 Het is ook prima om alles op `/` te zetten; dan is de bovenstaande indeling alleen een advies om te voorkomen dat Splunk-data de root-partitie volschrijft.
@@ -87,7 +99,7 @@ Het is ook prima om alles op `/` te zetten; dan is de bovenstaande indeling alle
 3. **Taal/toetsenbord:** English (US) als systeemtaal is het handigst voor foutmeldingen; toetsenbord naar wens (`nl` of `us`).
 4. **Time & Date:** Europe/Amsterdam, NTP aan.
 5. **Software Selection:** *Server* (zonder GUI) of *Minimal Install*. Geen "Container Management"-groep aanvinken (die installeert Podman, wat we niet nodig hebben).
-6. **Installation Destination:** kies de 2 TB-disk → *Custom* → maak de indeling uit §0.3 (LVM, XFS). Voeg **geen** swap toe.
+6. **Installation Destination:** kies de 4 TB-disk → *Custom* → maak de indeling uit §0.3 (LVM, XFS). Voeg **geen** swap toe.
 7. **Network & Host Name:**
    - Zet de netwerkinterface aan.
    - Hostnaam: `splunk-k8s` (of eigen keuze; **geen** hoofdletters of underscores — Kubernetes-nodenamen moeten DNS-conform zijn).
@@ -546,7 +558,7 @@ spec:
   monitoringConsoleRef:
     name: mc
   etcVolumeStorageConfig: { storageClassName: local-path, storageCapacity: 10Gi }
-  varVolumeStorageConfig: { storageClassName: local-path, storageCapacity: 250Gi }
+  varVolumeStorageConfig: { storageClassName: local-path, storageCapacity: 600Gi }
   resources:
     requests: { cpu: "1", memory: 4Gi }
     limits:   { cpu: "4", memory: 8Gi }
@@ -567,37 +579,9 @@ kubectl -n splunk-operator get indexercluster idx
 # idx    Ready   Ready     3         3
 ```
 
-### 6.4 Search-laag — kies A of B
+### 6.4 Search head (Standalone, gekoppeld aan de indexer-cluster)
 
-**Variant A: SearchHeadCluster (3 search heads + deployer, ~14 Gi RAM)**
-
-```bash
-cat > 03-shc.yaml <<'EOF'
-apiVersion: enterprise.splunk.com/v4
-kind: SearchHeadCluster
-metadata:
-  name: shc
-  namespace: splunk-operator
-  finalizers:
-  - enterprise.splunk.com/delete-pvc
-spec:
-  replicas: 3
-  clusterManagerRef:
-    name: cm
-  monitoringConsoleRef:
-    name: mc
-  etcVolumeStorageConfig: { storageClassName: local-path, storageCapacity: 10Gi }
-  varVolumeStorageConfig: { storageClassName: local-path, storageCapacity: 50Gi }
-  resources:
-    requests: { cpu: 500m, memory: 2Gi }
-    limits:   { cpu: "2",  memory: 4Gi }
-EOF
-kubectl apply -f 03-shc.yaml
-```
-
-De operator maakt automatisch een deployer (`splunk-shc-deployer-0`) en drie search heads (`splunk-shc-search-head-0/1/2`). Het SHC-bootstrappen duurt ~5–10 minuten.
-
-**Variant B: één Standalone search head (~4 Gi RAM, lichter)**
+Eén `Standalone`-instance met `clusterManagerRef` wordt door de operator automatisch als search head aan de indexer-cluster gekoppeld. Dit is de lichtste search-laag (~4 Gi RAM) en op een single node functioneel gelijkwaardig aan een SearchHeadCluster.
 
 ```bash
 cat > 03-sh.yaml <<'EOF'
@@ -614,19 +598,28 @@ spec:
   monitoringConsoleRef:
     name: mc
   etcVolumeStorageConfig: { storageClassName: local-path, storageCapacity: 10Gi }
-  varVolumeStorageConfig: { storageClassName: local-path, storageCapacity: 50Gi }
+  varVolumeStorageConfig: { storageClassName: local-path, storageCapacity: 100Gi }
   resources:
     requests: { cpu: 500m, memory: 2Gi }
     limits:   { cpu: "2",  memory: 4Gi }
 EOF
 kubectl apply -f 03-sh.yaml
+kubectl -n splunk-operator get pods -l app.kubernetes.io/instance=splunk-sh-standalone -w
+```
+
+Wacht op `splunk-sh-standalone-0` Running en:
+
+```bash
+kubectl -n splunk-operator get standalone sh
+# NAME   PHASE   DESIRED   READY
+# sh     Ready   1         1
 ```
 
 ### 6.5 Eindcontrole
 
 ```bash
 kubectl -n splunk-operator get pods
-kubectl -n splunk-operator get clustermanager,indexercluster,searchheadcluster,standalone,monitoringconsole
+kubectl -n splunk-operator get clustermanager,indexercluster,standalone,monitoringconsole
 kubectl -n splunk-operator get pvc
 kubectl top pods -n splunk-operator      # via rke2-metrics-server
 ```
@@ -651,9 +644,6 @@ kubectl -n splunk-operator get secret splunk-splunk-operator-secret \
 ### 7.1 Snel: port-forward
 
 ```bash
-# Search head cluster (variant A)
-kubectl -n splunk-operator port-forward --address 0.0.0.0 svc/splunk-shc-search-head-service 8000:8000
-# of Standalone (variant B)
 kubectl -n splunk-operator port-forward --address 0.0.0.0 svc/splunk-sh-standalone-service 8000:8000
 ```
 
@@ -676,7 +666,6 @@ metadata:
   namespace: splunk-operator
   annotations:
     nginx.ingress.kubernetes.io/proxy-body-size: "0"
-    nginx.ingress.kubernetes.io/affinity: "cookie"     # sticky sessions voor SHC
 spec:
   ingressClassName: nginx
   rules:
@@ -687,7 +676,7 @@ spec:
         pathType: Prefix
         backend:
           service:
-            name: splunk-shc-search-head-service   # variant B: splunk-sh-standalone-service
+            name: splunk-sh-standalone-service
             port: { number: 8000 }
   - host: cm.splunk.lan
     http:
@@ -856,7 +845,7 @@ kubectl get storageclass                    # local-path (default)
 
 # Splunk
 kubectl -n splunk-operator get pods         # allemaal 1/1 Running
-kubectl -n splunk-operator get clustermanager,indexercluster,searchheadcluster,monitoringconsole
+kubectl -n splunk-operator get clustermanager,indexercluster,standalone,monitoringconsole
                                             # allemaal Ready
 kubectl -n splunk-operator exec splunk-cm-cluster-manager-0 -- \
   /opt/splunk/bin/splunk show cluster-status -auth admin:"$(kubectl -n splunk-operator get secret splunk-splunk-operator-secret -o jsonpath='{.data.password}' | base64 -d)"
@@ -878,7 +867,7 @@ Functionele test: stuur een event via HEC (§7.3), zoek het op in Splunk Web, en
 
 ```bash
 kubectl -n splunk-operator logs -f splunk-idx-indexer-0            # Splunk-logs
-kubectl -n splunk-operator exec -it splunk-shc-search-head-0 -- bash
+kubectl -n splunk-operator exec -it splunk-sh-standalone-0 -- bash
 kubectl -n splunk-operator logs -f deploy/splunk-operator-controller-manager
 journalctl -u rke2-server -f
 crictl ps ; crictl images                                          # RKE2's containerd
@@ -920,9 +909,9 @@ Splunk Operator: lees vóór elke upgrade de upgrade-notities op https://splunk.
 | Pods blijven `ContainerCreating` met SELinux-denials (`ausearch -m avc -ts recent`) | `rke2-selinux` ontbreekt (tarball-install?) → `dnf install rke2-selinux`, of context van `/opt/local-path-provisioner` niet gezet → §4 |
 | PVC blijft `Pending` | Geen default StorageClass, of local-path-provisioner niet Running → `kubectl -n local-path-storage get pods` |
 | Splunk-pod crasht direct, log: *"You must accept the Splunk General Terms"* | `SPLUNK_GENERAL_TERMS` niet gezet in het operator-deployment → §5.1, daarna `kubectl -n splunk-operator rollout restart deploy/splunk-operator-controller-manager` en de Splunk-pods verwijderen zodat ze opnieuw starten |
-| Splunk-pod `OOMKilled` | Verhoog `resources.limits.memory` in het CR (indexers hebben bij zwaar zoekwerk >8 Gi nodig) of kies variant B in §6.4 |
+| Splunk-pod `OOMKilled` | Verhoog `resources.limits.memory` in het CR (indexers hebben bij zwaar zoekwerk >8 Gi nodig); er is ~10 GB marge (§0.2) |
 | IndexerCluster blijft in `Pending`/`ScalingUp` | Cluster Manager nog niet `Ready`; check `kubectl -n splunk-operator logs splunk-cm-cluster-manager-0` en of `replication_factor` ≤ aantal peers |
-| SHC blijft in `Pending` | Deployer moet eerst klaar zijn; SHC-bootstrap kan 10 minuten duren. Log: `kubectl -n splunk-operator logs splunk-shc-search-head-0` |
+| Standalone search head ziet de indexers niet | `clusterManagerRef` moet naar een `Ready` ClusterManager wijzen; check `kubectl -n splunk-operator logs splunk-sh-standalone-0` en in Splunk Web: Settings → Distributed search |
 | Splunk Web via ingress geeft 502/504 | Service-naam of poort klopt niet: `kubectl -n splunk-operator get svc` |
 | Portainer: *"Your Portainer instance timed out for security purposes"* | `docker restart portainer` en binnen 5 min het admin-account aanmaken |
 | Na starten van Docker: pods kunnen elkaar/DNS niet bereiken | Docker heeft `FORWARD`-policy op DROP gezet. Fix: `iptables -P FORWARD ACCEPT` en permanent: `"iptables": true` laten staan maar in `/etc/systemd/system/docker.service.d/override.conf` een `ExecStartPost=/usr/sbin/iptables -P FORWARD ACCEPT` toevoegen; of `"ip-forward-no-drop": true` in `daemon.json` (Docker ≥ 28) |
