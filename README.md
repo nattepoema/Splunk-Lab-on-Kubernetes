@@ -5,7 +5,7 @@ De specificaties van de gebruikte NUC zijn:
 - Minisforum UM790 Pro
 - AMD Risen 9 7940HS (8 Core / 16 Threads)
 - 64GB DDR5 RAM
-- 2 x 1TB NVMe
+- 4TB NVMe
 
 **Gebruikte software**
 | Component | Versie | Opmerking |
