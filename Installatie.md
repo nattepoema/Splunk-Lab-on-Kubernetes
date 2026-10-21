@@ -1,173 +1,212 @@
-| Component | Versie | Opmerking |
-|---|---|---|
-| AlmaLinux | 10.x (laatste point-release) | RHEL 10-compatibel; wordt door RKE2 als gevalideerd OS vermeld |
-| RKE2 | v1.34.x (kanaal `v1.34`) | Hoogste Kubernetes-minor die Splunk Operator 3.1.0 ondersteunt |
-| Splunk Operator | 3.1.0 | Ondersteunt Kubernetes 1.25 – 1.34 |
-| Splunk Enterprise image | `splunk/splunk:10.4.3` | Vereist voor K8s 1.34 (10.0.4+ of 10.4+) |
-| local-path-provisioner | v0.0.36 | Dynamische PersistentVolumes op lokale disk |
-| Docker Engine | laatste `docker-ce` uit de officiële repo | |
-| Portainer CE | `portainer/portainer-ce:lts` | Beheert Docker én (optioneel) het RKE2-cluster |
+Single-host lab build on AlmaLinux 10.2
 
-> **Ontwerpkeuze — twee container-runtimes op één host.** RKE2 gebruikt zijn eigen ingebouwde containerd (`/var/lib/rancher/rke2`) en raakt Docker niet aan. Docker Engine draait er los naast, met Portainer als web-UI. Beide gebruiken verschillende netwerken (Docker: `172.17.0.0/16`, RKE2: pods `10.42.0.0/16`, services `10.43.0.0/16`), dus er is geen overlap.
+Item Value
 
----
+Host
+AMD Ryzen 9 7940HS (8C/16T), 64 GB DDR4, 4 TB NVMe
+OS
+AlmaLinux OS 10.2 “Lavender Lion” (x86_64)
+Kubernetes
+K3s v1.36.5+k3s1 (Kubernetes 1.36)
+Operator
+Splunk Operator for Kubernetes (SOK) 3.2.0
+Splunk Enterprise
+splunk/splunk:10.6.0
+Universal Forwarder
+splunk/universalforwarder:10.6.0 via the SOK 3.2.0 UF Helm chart
+Compatibility check. SOK 3.2.0 (released 2026-09-08) lists Splunk Enterprise 10.6.0 as its supported Splunk version and Kubernetes 1.32 – 1.36 as supported Kubernetes versions. K3s v1.36.x is inside that range. Always re-check the SOK change log before deploying.
+Table of contents
+Target architecture and resource plan
+Install AlmaLinux 10.2
+Prepare the OS for Kubernetes and Splunk
+Install Kubernetes (K3s)
+Install Splunk Operator for Kubernetes 3.2.0
+Deploy the Splunk 10.6 environment
+Deploy the Universal Forwarder container
+Access and verification
+Operations: scale, upgrade, tear down
+Troubleshooting
+References
+0. Target architecture and resource plan
+Everything runs on one physical host as a single-node K3s cluster. All Splunk components live in namespace splunk; the operator runs in namespace splunk-operator.
+                       ┌─────────────────────── AlmaLinux 10.2 host ────────────────────────┐
+                       │  K3s (single node: control plane + worker)                          │
+                       │                                                                     │
+  Browser ──NodePort──▶│  [sh1 Standalone]   [sh2 Standalone]   [Monitoring Console]         │
+   :30801 / :30802     │         │  search          │  search                                │
+   :30800 (CM)         │         ▼                  ▼                                        │
+   :30803 (MC)         │  ┌──────── Indexer cluster "idxc" (3 peers) ────────┐               │
+                       │  │ idxc-indexer-0   idxc-indexer-1   idxc-indexer-2 │◀── S2S 9997 ──┤
+                       │  └──────────────────────┬───────────────────────────┘               │
+                       │                         │ managed by                                │
+                       │                  [Cluster Manager "cm"]    [License Manager "lm"]   │
+                       │                                                                     │
+  syslog UDP 514 ─────▶│  [Universal Forwarder Deployment "uf"] ──── tcpout (useACK) ────────┘
+                       │  Storage: local-path provisioner on /var/lib/rancher (XFS, ~3.6 TB) │
+                       └─────────────────────────────────────────────────────────────────────┘
+​
+Component
+CR kind / chart
+Pods
+CPU req / limit
+Memory req / limit
+Persistent storage (etc / var)
+License Manager lm
+LicenseManager
+1
+0.5 / 1
+1 Gi / 2 Gi
+10 Gi / 20 Gi
+Cluster Manager cm
+ClusterManager
+1
+1 / 2
+2 Gi / 4 Gi
+10 Gi / 50 Gi
+Indexer cluster idxc
+IndexerCluster
+3
+2 / 4 each
+6 Gi / 10 Gi each
+10 Gi / 900 Gi each
+Search head sh1
+Standalone + clusterManagerRef
+1
+2 / 4
+4 Gi / 8 Gi
+10 Gi / 100 Gi
+Search head sh2
+Standalone + clusterManagerRef
+1
+2 / 4
+4 Gi / 8 Gi
+10 Gi / 100 Gi
+Monitoring Console mc (optional)
+MonitoringConsole
+1
+0.5 / 2
+2 Gi / 4 Gi
+10 Gi / 20 Gi
+Universal Forwarder uf
+Helm splunk-universalforwarder
+1
+0.1 / 0.5
+256 Mi / 1 Gi
+emptyDir (stateless)
+Total
+9
+≈ 12.1 / 27.5
+≈ 31 Gi / 57 Gi
+≈ 3 TB
+Notes on sizing:
+16 hardware threads and ~60 GiB allocatable memory (after OS and kubelet reservations) are enough for the requests above. Limits are deliberately over-committed on CPU; memory limits stay under physical RAM.
+The two search heads are independent (not a Search Head Cluster). A SHC needs at least 3 members plus a deployer; you asked for 2 separate search heads, so two Standalone CRs that both point at the cluster manager is the correct pattern.
+The K3s local-path provisioner does not enforce PVC capacity. The numbers are a budget; actual limits come from Splunk index settings (maxTotalDataSizeMB) and free disk.
+Indexer replication factor 3 / search factor 2 means every bucket is stored three times on the same physical disk. That is fine for a lab and functionally realistic, but it is not real redundancy.
+A License Manager is mandatory: every instance is a licence peer of lm. You need a licence file (a free Splunk Developer License is fine) before §5 — see §5.2.
+1. Install AlmaLinux 10.2
+1.1 Firmware (BIOS/UEFI) settings on the 7940HS
+Update the mini-PC/laptop firmware to the latest version.
+UMA frame buffer / iGPU memory (Radeon 780M): set to the minimum (e.g. 512 MB). Every GB reserved for the iGPU is taken from the 64 GB system RAM.
+SVM (AMD-V): enable (harmless, useful if you later run VMs).
+Boot mode: UEFI only. Secure Boot may stay enabled — AlmaLinux ships signed shim/kernel.
+Power: set “Restore on AC power loss” to On if this box should behave like a server.
+1.2 Download and verify the ISO
+The Ryzen 7940HS (Zen 4) supports x86-64-v3/v4, so use the standard x86_64 image (not x86_64_v2).
+# On any Linux workstation
+ARCH=x86_64
+wget https://repo.almalinux.org/almalinux/10.2/isos/${ARCH}/AlmaLinux-10.2-${ARCH}-dvd.iso
+wget https://repo.almalinux.org/almalinux/10.2/isos/${ARCH}/CHECKSUM
+wget https://repo.almalinux.org/almalinux/RPM-GPG-KEY-AlmaLinux-10
 
-## Inhoud
-
-0. Overzicht en planning van resources
-1. AlmaLinux 10 installeren
-2. Basisconfiguratie van het OS
-3. RKE2 (Kubernetes) installeren
-4. Storage: local-path-provisioner
-5. Splunk Operator installeren
-6. Splunk-cluster uitrollen (ClusterManager, 3 indexers, Standalone search head, Monitoring Console)
-7. Toegang tot Splunk Web
-8. Docker Engine installeren
-9. Portainer CE installeren
-10. (Optioneel) RKE2-cluster koppelen aan Portainer
-11. Verificatie-checklist
-12. Beheer, back-up en upgrades
-13. Troubleshooting
-
----
-
-## 0. Overzicht en planning van resources
-
-### 0.1 Wat er straks draait
-
-```
-AlmaLinux 10 (bare metal)
-├── RKE2 (rke2-server, embedded containerd, Canal CNI, ingress-nginx)
-│   ├── namespace splunk-operator
-│   │   ├── splunk-operator-controller-manager
-│   │   ├── splunk-cm-cluster-manager-0
-│   │   ├── splunk-idx-indexer-0/1/2
-│   │   ├── splunk-sh-standalone-0          (search head)
-│   │   └── splunk-mc-monitoring-console-0
-│   ├── namespace local-path-storage
-│   └── (optioneel) namespace portainer  → Portainer Kubernetes-agent
-└── Docker Engine
-    └── portainer (web-UI op https://<ip>:9443)
-```
-
-### 0.2 Geheugenbudget (64 GB)
-
-| Onderdeel | Aantal | RAM-limiet per pod | Totaal |
-|---|---|---|---|
-| Indexers | 3 | 8 Gi | 24 Gi |
-| Search head (Standalone) | 1 | 4 Gi | 4 Gi |
-| Cluster Manager | 1 | 3 Gi | 3 Gi |
-| Monitoring Console | 1 | 2 Gi | 2 Gi |
-| Splunk Operator | 1 | ~0,5 Gi | 0,5 Gi |
-| RKE2 control plane + Canal + ingress | – | – | ~4 Gi |
-| Docker + Portainer | – | – | ~1 Gi |
-| OS + marge | – | – | ~15 Gi |
-| **Totaal** | | | **~54 Gi** |
-
-Dat laat ~10 GB ruimte over. De search-laag is bewust één `Standalone` search head met `clusterManagerRef` (4 Gi) in plaats van een SearchHeadCluster (3 search heads + deployer, ~14 Gi): op één fysieke node voegt een SHC geen echte redundantie toe, maar kost wel veel geheugen. Wil je later toch een SHC oefenen, dan kun je de `Standalone` vervangen door een `SearchHeadCluster`-CR met dezelfde `clusterManagerRef`.
-
-### 0.3 Disk-indeling (4 TB)
-
-Aanbevolen partitionering tijdens de installatie (LVM, XFS):
-
-| Mountpoint | Grootte | Doel |
-|---|---|---|
-| `/boot` | 1 GB | |
-| `/boot/efi` | 600 MB | (bij UEFI) |
-| `/` | 100 GB | OS, `/opt`, `/usr` |
-| `/var/lib/rancher` | 250 GB | RKE2, containerd-images, etcd |
-| `/var/lib/docker` | 150 GB | Docker-images en -volumes |
-| `/opt/local-path-provisioner` | rest (~3,4 TB) | PersistentVolumes voor Splunk |
-| swap | geen | Kubernetes vereist swap uit |
-
-Het is ook prima om alles op `/` te zetten; dan is de bovenstaande indeling alleen een advies om te voorkomen dat Splunk-data de root-partitie volschrijft.
-
-### 0.4 Wat je klaar moet hebben liggen
-
-- AlmaLinux 10 ISO (`AlmaLinux-10-latest-x86_64-dvd.iso` of `-minimal.iso`) van https://almalinux.org/get-almalinux/
-- USB-stick (8 GB+) en een tool als Rufus, balenaEtcher of `dd`
-- Een vast IP-adres (of DHCP-reservering) en een hostnaam, bijv. `splunk-k8s.lan` / `192.168.1.50`
-- Een werkstation met SSH-client en browser
-- (Optioneel) een Splunk Enterprise-licentiebestand; zonder licentie draait Splunk 60 dagen in trial-modus
-
----
-
-## 1. AlmaLinux 10 installeren
-
-1. Schrijf de ISO naar de USB-stick en boot de machine ervan (UEFI-modus, Secure Boot mag aan blijven — AlmaLinux is gesigneerd).
-2. Kies **Install AlmaLinux 10**.
-3. **Taal/toetsenbord:** English (US) als systeemtaal is het handigst voor foutmeldingen; toetsenbord naar wens (`nl` of `us`).
-4. **Time & Date:** Europe/Amsterdam, NTP aan.
-5. **Software Selection:** *Server* (zonder GUI) of *Minimal Install*. Geen "Container Management"-groep aanvinken (die installeert Podman, wat we niet nodig hebben).
-6. **Installation Destination:** kies de 4 TB-disk → *Custom* → maak de indeling uit §0.3 (LVM, XFS). Voeg **geen** swap toe.
-7. **Network & Host Name:**
-   - Zet de netwerkinterface aan.
-   - Hostnaam: `splunk-k8s` (of eigen keuze; **geen** hoofdletters of underscores — Kubernetes-nodenamen moeten DNS-conform zijn).
-   - Configure → IPv4 → *Manual* → vast IP, gateway, DNS. (Of laat DHCP staan als je een reservering hebt gemaakt.)
-8. **User Creation:** maak een gebruiker aan, bijv. `eric`, vink *Make this user administrator* aan (sudo). Zet een sterk root-wachtwoord.
-9. **Security Profile:** geen profiel selecteren.
-10. Begin de installatie, reboot en verwijder de USB-stick.
-
-Log daarna in via SSH vanaf je werkstation:
-
-```bash
-ssh eric@192.168.1.50
-```
-
-Alle volgende commando's draai je als root, tenzij anders aangegeven:
-
-```bash
-sudo -i
-```
-
----
-
-## 2. Basisconfiguratie van het OS
-
-### 2.1 Updaten en basistools
-
-```bash
-dnf -y update
-dnf -y install vim curl wget tar git jq bash-completion policycoreutils-python-utils \
-               container-selinux iptables-nft nfs-utils chrony tmux htop
+gpg --import RPM-GPG-KEY-AlmaLinux-10
+gpg --verify CHECKSUM                     # expect: Good signature from "AlmaLinux OS 10"
+sha256sum AlmaLinux-10.2-${ARCH}-dvd.iso
+grep -E "SHA256.*AlmaLinux-10.2-${ARCH}-dvd.iso" CHECKSUM   # hashes must match
+​
+Write the ISO to a USB stick (≥ 16 GB). This erases the stick — double-check the device name:
+lsblk                                     # identify the USB stick, e.g. /dev/sdX
+sudo dd if=AlmaLinux-10.2-x86_64-dvd.iso of=/dev/sdX bs=4M status=progress oflag=sync
+​
+(On Windows use Rufus in “DD image” mode or Fedora Media Writer.)
+1.3 Anaconda installer choices
+Boot from the USB stick and choose Install AlmaLinux 10.2.
+Screen
+Setting
+Language / Keyboard
+As required (e.g. English (US), keyboard us or nl)
+Time & Date
+Region Europe / Amsterdam, Network Time ON
+Software Selection
+Minimal Install (add Standard and Headless Management if you want Cockpit)
+Installation Destination
+NVMe 4 TB → Custom partitioning (see 1.4)
+KDUMP
+Disabled (saves ~512 MB RAM)
+Network & Host Name
+Hostname splunk-k3s.lab.local; enable the wired NIC, set a static IPv4 (example used below: 192.168.1.50/24, gateway 192.168.1.1, DNS 192.168.1.1)
+Security Profile
+None (a CIS profile can break K3s networking)
+Root password
+Set a strong one; leave “Allow root SSH login with password” off
+User creation
+Create user splunkadm, tick Make this user administrator (wheel)
+1.4 Partition layout (GPT, UEFI)
+Choose Custom, scheme LVM, then create:
+Mount point
+Size
+Filesystem
+Notes
+/boot/efi
+1 GiB
+EFI System Partition
+/boot
+2 GiB
+xfs
+/
+150 GiB
+xfs (LVM almalinux/root)
+OS, /var/log, packages
+/var/lib/rancher
+all remaining space (~3.5 TiB)
+xfs (LVM almalinux/rancher)
+K3s data, container images, all Splunk PVCs
+swap
+none
+—
+Kubernetes expects swap off
+If Anaconda insists on swap, create a small one and disable it in §2.3.
+Click Begin Installation, wait, then Reboot System and remove the USB stick.
+1.5 First login
+ssh splunkadm@192.168.1.50
+cat /etc/almalinux-release          # AlmaLinux release 10.2 (Lavender Lion)
+uname -r                            # 6.12.0-*.el10_2.x86_64
+lsblk -f                            # confirm /var/lib/rancher is the large XFS volume
+df -h /var/lib/rancher
+​
+2. Prepare the OS for Kubernetes and Splunk
+All commands in this section run as root (sudo -i).
+2.1 Update and base packages
+dnf -y upgrade --refresh
+dnf -y install curl wget tar git jq vim bash-completion \
+  container-selinux policycoreutils-python-utils \
+  iptables-nft nftables kernel-modules-extra \
+  chrony tuned
 systemctl enable --now chronyd
-reboot   # als er een nieuwe kernel is geïnstalleerd
-```
-
-### 2.2 Hostnaam en /etc/hosts
-
-```bash
-hostnamectl set-hostname splunk-k8s
-echo "192.168.1.50  splunk-k8s splunk-k8s.lan" >> /etc/hosts
-```
-
-### 2.3 Firewalld uitschakelen
-
-RKE2's standaard-CNI (Canal = Calico + Flannel) conflicteert met firewalld. De officiële RKE2-documentatie schrijft voor firewalld uit te zetten; de kernel-firewall (nftables) blijft actief en wordt door Canal beheerd.
-
-```bash
-systemctl disable --now firewalld
-systemctl mask firewalld
-```
-
-> Sta je de machine bloot aan een onvertrouwd netwerk, beperk dan de toegang op je router/perimeter-firewall. Relevante poorten op deze host: 22 (SSH), 6443 (Kubernetes API), 9443 (Portainer), 80/443 (ingress), 30000–32767 (NodePorts).
-
-### 2.4 NetworkManager: CNI-interfaces met rust laten
-
-```bash
-cat > /etc/NetworkManager/conf.d/rke2-canal.conf <<'EOF'
-[keyfile]
-unmanaged-devices=interface-name:flannel*;interface-name:cali*;interface-name:tunl*;interface-name:vxlan.calico;interface-name:vxlan-v6.calico;interface-name:wireguard.cali;interface-name:wg-v6.cali
-EOF
-systemctl reload NetworkManager
-
-# nm-cloud-setup bestaat alleen op cloud-images; uitzetten kan geen kwaad
-systemctl disable --now nm-cloud-setup.service nm-cloud-setup.timer 2>/dev/null || true
-```
-
-### 2.5 Kernelinstellingen
-
-```bash
+reboot
+​
+kernel-modules-extra provides netfilter modules that container networking may need on EL10 kernels.
+2.2 Hostname resolution
+hostnamectl set-hostname splunk-k3s.lab.local
+echo "192.168.1.50  splunk-k3s.lab.local splunk-k3s" >> /etc/hosts
+​
+2.3 Disable swap (including zram, if present)
+swapoff -a
+sed -ri '/\sswap\s/s/^/#/' /etc/fstab
+dnf -y remove zram-generator-defaults 2>/dev/null || true
+free -h        # Swap: 0B
+​
+2.4 Kernel modules and sysctls
 cat > /etc/modules-load.d/k8s.conf <<'EOF'
 overlay
 br_netfilter
@@ -175,777 +214,615 @@ EOF
 modprobe overlay
 modprobe br_netfilter
 
-cat > /etc/sysctl.d/90-kubernetes.conf <<'EOF'
+cat > /etc/sysctl.d/90-k8s-splunk.conf <<'EOF'
+net.ipv4.ip_forward                 = 1
 net.bridge.bridge-nf-call-iptables  = 1
 net.bridge.bridge-nf-call-ip6tables = 1
-net.ipv4.ip_forward                 = 1
-# Splunk-aanbevelingen
-vm.max_map_count                    = 262144
+# Many pods + Splunk file monitoring
 fs.inotify.max_user_instances       = 8192
 fs.inotify.max_user_watches         = 1048576
+fs.file-max                         = 6553600
+vm.swappiness                       = 0
 EOF
 sysctl --system
-```
-
-### 2.6 Swap controleren
-
-```bash
-swapon --show        # moet leeg zijn
-sed -i '/ swap / s/^/#/' /etc/fstab   # alleen nodig als er toch swap in staat
-```
-
-### 2.7 Transparent Huge Pages uit (Splunk-aanbeveling)
-
-```bash
-cat > /etc/systemd/system/disable-thp.service <<'EOF'
-[Unit]
-Description=Disable Transparent Huge Pages
-After=sysinit.target local-fs.target
-
-[Service]
-Type=oneshot
-ExecStart=/bin/sh -c 'echo never > /sys/kernel/mm/transparent_hugepage/enabled; echo never > /sys/kernel/mm/transparent_hugepage/defrag'
-
-[Install]
-WantedBy=basic.target
-EOF
-systemctl daemon-reload
-systemctl enable --now disable-thp.service
-cat /sys/kernel/mm/transparent_hugepage/enabled   # verwacht: always madvise [never]
-```
-
-### 2.8 SELinux
-
-Laat SELinux op **Enforcing** staan. RKE2 installeert via de RPM-methode automatisch het `rke2-selinux`-beleid. Controleer:
-
-```bash
-getenforce   # Enforcing
-```
-
----
-
-## 3. RKE2 (Kubernetes) installeren
-
-### 3.1 Configuratiebestand aanmaken (vóór de installatie)
-
-```bash
-mkdir -p /etc/rancher/rke2
-cat > /etc/rancher/rke2/config.yaml <<'EOF'
-# Kubeconfig leesbaar voor niet-root gebruikers
-write-kubeconfig-mode: "0644"
-
-# Extra namen/IP's in het API-server-certificaat
-tls-san:
-  - splunk-k8s
-  - splunk-k8s.lan
-  - 192.168.1.50
-
-# Single node: geen taint op de control-plane, zodat Splunk-pods hier mogen draaien
-node-label:
-  - "node-role.kubernetes.io/splunk=true"
-
-# Standaardwaarden expliciet (mag je weglaten)
-cni: canal
-cluster-cidr: 10.42.0.0/16
-service-cidr: 10.43.0.0/16
-
-# Kubelet: reserveer wat resources voor het OS
+​
+2.5 Disable Transparent Huge Pages (Splunk recommendation)
+grubby --update-kernel=ALL --args="transparent_hugepage=never"
+tuned-adm profile throughput-performance
+reboot
+# after reboot:
+cat /sys/kernel/mm/transparent_hugepage/enabled    # ...[never]
+​
+THP is a kernel-wide setting, so setting it on the host also applies to all Splunk containers.
+2.6 Firewall (firewalld stays enabled)
+# Kubernetes API (only needed from your admin workstation)
+firewall-cmd --permanent --add-port=6443/tcp
+# Trust the K3s pod and service CIDRs
+firewall-cmd --permanent --zone=trusted --add-source=10.42.0.0/16
+firewall-cmd --permanent --zone=trusted --add-source=10.43.0.0/16
+# Splunk Web NodePorts (cm, sh1, sh2, mc, lm) – defined in §5.8
+firewall-cmd --permanent --add-port=30800-30804/tcp
+# Optional: syslog into the UF from the LAN (NodePort defined in §6.4)
+firewall-cmd --permanent --add-port=30514/udp
+firewall-cmd --reload
+firewall-cmd --list-all
+​
+2.7 SELinux
+Leave SELinux in enforcing mode; K3s is configured with selinux: true in §3.1.
+getenforce          # Enforcing
+​
+3. Install Kubernetes (K3s)
+3.1 K3s configuration file
+Create the config before running the installer so the first start already uses it.
+mkdir -p /etc/rancher/k3s
+cat > /etc/rancher/k3s/config.yaml <<'EOF'
+write-kubeconfig-mode: "0600"
+node-name: splunk-k3s
+selinux: true
+# Traefik is not needed (we use NodePorts); keep servicelb, local-storage, metrics-server
+disable:
+  - traefik
+# Keep resources back for the OS and K3s itself
 kubelet-arg:
   - "system-reserved=cpu=1,memory=2Gi"
-  - "kube-reserved=cpu=500m,memory=1Gi"
+  - "kube-reserved=cpu=1,memory=2Gi"
+  - "eviction-hard=memory.available<1Gi,nodefs.available<5%,imagefs.available<5%"
   - "max-pods=110"
+# Default data dir is /var/lib/rancher/k3s (on the large XFS volume)
 EOF
-```
+​
+3.2 Install K3s (pinned to a version supported by SOK 3.2.0)
+curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="v1.36.5+k3s1" sh -
+​
+The installer detects SELinux and tries to install the k3s-selinux policy RPM from rpm.rancher.io for your EL major version.
+If the installer fails on the SELinux RPM (no EL10 build available for your date), you have two lab-acceptable options:
+Re-run with INSTALL_K3S_SKIP_SELINUX_RPM=true, then set selinux: false in config.yaml and run SELinux in permissive mode (setenforce 0 and SELINUX=permissive in /etc/selinux/config), or
+Check https://rpm.rancher.io/k3s/stable/common/ for an el10 (or centos/10) repo, add it manually, dnf install k3s-selinux, and re-run the installer.
+3.3 Verify and configure kubectl for the admin user
+systemctl status k3s --no-pager
+k3s kubectl get nodes -o wide         # STATUS Ready, VERSION v1.36.5+k3s1
+k3s kubectl get pods -A               # coredns, local-path-provisioner, metrics-server Running
+k3s kubectl get storageclass          # local-path (default)
 
-> RKE2 zet standaard **geen** NoSchedule-taint op server-nodes, dus workloads mogen op deze single node landen. Er is dus niets extra's nodig.
-
-### 3.2 Installeren
-
-Het installatiescript detecteert een RPM-gebaseerd systeem en gebruikt automatisch de RPM-methode (inclusief `rke2-selinux`). We pinnen op het `v1.34`-kanaal omdat Splunk Operator 3.1.0 tot en met Kubernetes 1.34 ondersteunt.
-
-```bash
-curl -sfL https://get.rke2.io | INSTALL_RKE2_CHANNEL=v1.34 INSTALL_RKE2_TYPE=server sh -
-```
-
-Controleer wat er is geïnstalleerd:
-
-```bash
-rpm -qa | grep rke2      # rke2-server, rke2-common, rke2-selinux
-cat /etc/sysconfig/rke2-server   # bevat RKE2_SELINUX=true
-```
-
-### 3.3 Starten
-
-```bash
-systemctl enable --now rke2-server.service
-journalctl -u rke2-server -f     # volg de logs; Ctrl-C als 'rke2 is up and running' verschijnt
-```
-
-De eerste start duurt 2–5 minuten (images worden gedownload).
-
-### 3.4 kubectl instellen
-
-```bash
-# Voor root
+# kubeconfig for splunkadm
+exit                                  # back to splunkadm
 mkdir -p ~/.kube
-ln -sf /etc/rancher/rke2/rke2.yaml ~/.kube/config
-ln -sf /var/lib/rancher/rke2/bin/kubectl /usr/local/bin/kubectl
-ln -sf /var/lib/rancher/rke2/bin/crictl  /usr/local/bin/crictl
-ln -sf /var/lib/rancher/rke2/bin/ctr     /usr/local/bin/ctr
-
-cat > /etc/profile.d/rke2.sh <<'EOF'
-export KUBECONFIG=/etc/rancher/rke2/rke2.yaml
-export CRI_CONFIG_FILE=/var/lib/rancher/rke2/agent/etc/crictl.yaml
-export PATH=$PATH:/var/lib/rancher/rke2/bin
-source <(kubectl completion bash) 2>/dev/null
-EOF
-source /etc/profile.d/rke2.sh
-```
-
-Voor je gewone gebruiker (`eric`) werkt hetzelfde profile-script, omdat de kubeconfig met `0644` is weggeschreven.
-
-### 3.5 Helm installeren (handig voor later)
-
-```bash
+sudo cp /etc/rancher/k3s/k3s.yaml ~/.kube/config
+sudo chown $(id -u):$(id -g) ~/.kube/config
+chmod 600 ~/.kube/config
+echo 'source <(kubectl completion bash)' >> ~/.bashrc
+echo 'alias k=kubectl; complete -o default -F __start_kubectl k' >> ~/.bashrc
+source ~/.bashrc
+kubectl get nodes
+​
+3.4 Install Helm (needed for the UF chart)
+dnf -y install openssl tar
 curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
 helm version
-```
-
-### 3.6 Controle
-
-```bash
-kubectl get nodes -o wide
-# NAME         STATUS   ROLES                       VERSION
-# splunk-k8s   Ready    control-plane,etcd,master   v1.34.x+rke2r1
-
-kubectl get pods -A
-# Alle pods in kube-system Running/Completed:
-# rke2-canal-*, rke2-coredns-*, rke2-ingress-nginx-controller-*, rke2-metrics-server-*, etcd-*, kube-apiserver-* ...
-```
-
-Wil je de kubeconfig op je werkstation gebruiken:
-
-```bash
-# op je werkstation
-scp eric@192.168.1.50:/etc/rancher/rke2/rke2.yaml ~/.kube/splunk-k8s.yaml
-sed -i 's/127.0.0.1/192.168.1.50/' ~/.kube/splunk-k8s.yaml
-export KUBECONFIG=~/.kube/splunk-k8s.yaml
-kubectl get nodes
-```
-
----
-
-## 4. Storage: local-path-provisioner
-
-RKE2 levert (anders dan k3s) geen storage-provisioner mee. Splunk Operator heeft een StorageClass nodig voor de `etc`- en `var`-volumes van elke pod. Voor een single node is Rancher's local-path-provisioner de eenvoudigste keuze: elke PVC wordt een map onder `/opt/local-path-provisioner`.
-
-```bash
-mkdir -p /opt/local-path-provisioner
-# SELinux-context zodat containers erin mogen schrijven
-semanage fcontext -a -t container_file_t "/opt/local-path-provisioner(/.*)?"
-restorecon -Rv /opt/local-path-provisioner
-
-kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.36/deploy/local-path-storage.yaml
-
-# Maak 'local-path' de standaard StorageClass
-kubectl patch storageclass local-path \
-  -p '{"metadata": {"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
-
-kubectl get storageclass
-# NAME                   PROVISIONER             RECLAIMPOLICY   VOLUMEBINDINGMODE
-# local-path (default)   rancher.io/local-path   Delete          WaitForFirstConsumer
-```
-
-Snelle test:
-
-```bash
-cat <<'EOF' | kubectl apply -f -
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: test-pvc
-spec:
-  accessModes: [ReadWriteOnce]
-  resources: { requests: { storage: 1Gi } }
----
-apiVersion: v1
-kind: Pod
-metadata:
-  name: test-pod
-spec:
-  containers:
-  - name: sh
-    image: busybox
-    command: ["sh","-c","echo ok > /data/ok && sleep 3600"]
-    volumeMounts: [{ name: data, mountPath: /data }]
-  volumes:
-  - name: data
-    persistentVolumeClaim: { claimName: test-pvc }
-EOF
-sleep 20
-kubectl exec test-pod -- cat /data/ok      # ok
-kubectl delete pod test-pod; kubectl delete pvc test-pvc
-```
-
-> **Let op:** local-path-provisioner heeft `reclaimPolicy: Delete`. Verwijder je een Splunk-CR (met de `enterprise.splunk.com/delete-pvc`-finalizer), dan is de data weg. Zie §12 voor back-up.
-
----
-
-## 5. Splunk Operator installeren
-
-### 5.1 Operator-manifest downloaden en aanpassen
-
-Sinds Operator 3.0.0 **moet** je de Splunk General Terms accepteren via de omgevingsvariabele `SPLUNK_GENERAL_TERMS`, anders starten Splunk 10.x-containers niet. Bovendien zetten we de Splunk-image op 10.4.3 (vereist voor Kubernetes 1.34).
-
-```bash
-mkdir -p ~/splunk && cd ~/splunk
+​
+3.5 (Optional) Pre-pull the large Splunk images
+Pre-pulling avoids long ContainerCreating phases and Docker Hub rate-limit surprises:
+sudo k3s ctr images pull docker.io/splunk/splunk:10.6.0
+sudo k3s ctr images pull docker.io/splunk/universalforwarder:10.6.0
+sudo k3s ctr images pull docker.io/splunk/splunk-operator:3.2.0
+​
+Image tags. Starting with 10.6, Splunk uses four-segment versions (e.g. 10.6.0.x). Confirm the exact tag on Docker Hub (splunk/splunk, splunk/universalforwarder) and use it consistently in every manifest below. This guide uses 10.6.0, the version listed as supported by SOK 3.2.0.
+4. Install Splunk Operator for Kubernetes 3.2.0
+The cluster-wide manifest installs the CRDs, RBAC, the validation webhook and the operator Deployment into namespace splunk-operator, watching all namespaces.
+4.1 Download and apply the manifest
+mkdir -p ~/splunk-k8s && cd ~/splunk-k8s
 wget -O splunk-operator-cluster.yaml \
-  https://github.com/splunk/splunk-operator/releases/download/3.1.0/splunk-operator-cluster.yaml
-
-# 1) General Terms accepteren
-sed -i '/name: SPLUNK_GENERAL_TERMS/{n;s|value: ""|value: "--accept-sgt-current-at-splunk-com"|}' splunk-operator-cluster.yaml
-
-# 2) Splunk Enterprise image op 10.4.3
-sed -i 's|value: splunk/splunk:10.2.0|value: splunk/splunk:10.4.3|' splunk-operator-cluster.yaml
-
-# Controle
-grep -n -A1 'name: SPLUNK_GENERAL_TERMS\|name: RELATED_IMAGE_SPLUNK_ENTERPRISE' splunk-operator-cluster.yaml
-```
-
-Verwacht:
-
-```
-- name: RELATED_IMAGE_SPLUNK_ENTERPRISE
-  value: splunk/splunk:10.4.3
-- name: SPLUNK_GENERAL_TERMS
-  value: "--accept-sgt-current-at-splunk-com"
-```
-
-> Lees de Splunk General Terms op https://www.splunk.com/en_us/legal/splunk-general-terms.html voordat je dit accepteert.
-
-### 5.2 Toepassen
-
-De CRD's zijn groot; gebruik daarom `--server-side` (zoals de Splunk-documentatie voorschrijft).
-
-```bash
+  https://github.com/splunk/splunk-operator/releases/download/3.2.0/splunk-operator-cluster.yaml
 kubectl apply -f splunk-operator-cluster.yaml --server-side
-kubectl -n splunk-operator get pods -w
-# splunk-operator-controller-manager-xxxx   1/1   Running
-```
-
-```bash
+​
+4.2 Accept the Splunk General Terms and pin the Splunk image
+Since SOK 3.0.0 / Splunk 10.x, Splunk containers will not start unless the operator passes SPLUNK_GENERAL_TERMS=--accept-sgt-current-at-splunk-com.
+Legal: Read the Splunk General Terms first. Setting this value means you have read and accept the current version of those terms.
+kubectl -n splunk-operator set env deployment/splunk-operator-controller-manager \
+  SPLUNK_GENERAL_TERMS="--accept-sgt-current-at-splunk-com" \
+  RELATED_IMAGE_SPLUNK_ENTERPRISE="splunk/splunk:10.6.0"
+​
+4.3 Verify the operator
+kubectl -n splunk-operator rollout status deployment/splunk-operator-controller-manager
+kubectl -n splunk-operator get pods
 kubectl get crd | grep enterprise.splunk.com
-# clustermanagers, indexerclusters, licensemanagers, monitoringconsoles,
-# searchheadclusters, standalones, ... (11 CRD's)
-```
-
-### 5.3 Splunk-image alvast binnenhalen (optioneel, scheelt wachttijd)
-
-```bash
-crictl pull docker.io/splunk/splunk:10.4.3
-```
-
----
-
-## 6. Splunk-cluster uitrollen
-
-We rollen uit in namespace `splunk-operator` (waar de operator al draait; cluster-wide mag het ook in een eigen namespace). Volgorde is belangrijk: eerst Monitoring Console en ClusterManager, dan de IndexerCluster, dan de search-laag.
-
-### 6.1 (Optioneel) Licentie
-
-Sla dit over als je de 60-daagse trial wilt gebruiken.
-
-```bash
-kubectl -n splunk-operator create configmap splunk-licenses --from-file=enterprise.lic
-
-cat <<'EOF' | kubectl apply -f -
+# Expect at least: clustermanagers, indexerclusters, licensemanagers, monitoringconsoles,
+#                  searchheadclusters, standalones  (all .enterprise.splunk.com)
+kubectl -n splunk-operator get deploy splunk-operator-controller-manager \
+  -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'     # splunk/splunk-operator:3.2.0
+kubectl -n splunk-operator logs deploy/splunk-operator-controller-manager --tail=30
+​
+5. Deploy the Splunk 10.6 environment
+Deployment order: License Manager → Cluster Manager → Indexer cluster → Search heads + Monitoring Console. Every Splunk instance references the License Manager through licenseManagerRef, so it must exist first.
+Tip: create each file with cat > file.yaml <<'EOF' … EOF (spaces only, no tabs) and validate it first with kubectl apply --dry-run=server -f file.yaml.
+5.1 Namespace
+kubectl create namespace splunk
+​
+SOK automatically generates a namespace-wide secret, splunk-splunk-secret (pattern splunk-<namespace>-secret), holding the admin password, pass4SymmKey, idxc_secret and HEC token shared by all Splunk pods in the namespace.
+5.2 Licence file
+A Splunk Enterprise licence file is required for this build. Options:
+Splunk Developer License (free, 10 GB/day, 6 months, renewable) — request it at https://dev.splunk.com/enterprise/dev_license/
+Enterprise licence from your Splunk account team.
+Copy the licence file (an XML file, usually *.lic or Splunk.License) to the host, e.g. ~/splunk-k8s/enterprise.lic, and check it:
+cd ~/splunk-k8s
+head -c 300 enterprise.lic; echo        # must start with <license>
+grep -oE '<(expiration_time|quota|label)>[^<]+' enterprise.lic
+​
+Store it in a ConfigMap. SOK mounts every entry under spec.volumes at /mnt/<volume-name>/ inside the pod:
+kubectl -n splunk create configmap splunk-licenses --from-file=enterprise.lic=./enterprise.lic
+kubectl -n splunk get configmap splunk-licenses
+​
+Multiple licence files (stacking): add each with an extra --from-file=<name>.lic=./<file> and list them comma-separated in licenseUrl, e.g. /mnt/licenses/enterprise.lic,/mnt/licenses/extra.lic.
+5.3 License Manager — 00-license-manager.yaml
 apiVersion: enterprise.splunk.com/v4
 kind: LicenseManager
 metadata:
   name: lm
-  namespace: splunk-operator
+  namespace: splunk
   finalizers:
-  - enterprise.splunk.com/delete-pvc
+    - enterprise.splunk.com/delete-pvc
 spec:
+  image: splunk/splunk:10.6.0
+  imagePullPolicy: IfNotPresent
   volumes:
     - name: licenses
       configMap:
         name: splunk-licenses
   licenseUrl: /mnt/licenses/enterprise.lic
-  etcVolumeStorageConfig: { storageClassName: local-path, storageCapacity: 5Gi }
-  varVolumeStorageConfig: { storageClassName: local-path, storageCapacity: 10Gi }
+  monitoringConsoleRef:
+    name: mc
   resources:
-    requests: { cpu: 250m, memory: 1Gi }
-    limits:   { cpu: "1",  memory: 2Gi }
-EOF
-```
-
-Voeg dan aan elk CR hieronder `licenseManagerRef: { name: lm }` toe in de `spec`.
-
-### 6.2 Monitoring Console + ClusterManager
-
-```bash
-cat > 01-mc-cm.yaml <<'EOF'
-apiVersion: enterprise.splunk.com/v4
-kind: MonitoringConsole
-metadata:
-  name: mc
-  namespace: splunk-operator
-  finalizers:
-  - enterprise.splunk.com/delete-pvc
-spec:
-  etcVolumeStorageConfig: { storageClassName: local-path, storageCapacity: 5Gi }
-  varVolumeStorageConfig: { storageClassName: local-path, storageCapacity: 20Gi }
-  resources:
-    requests: { cpu: 250m, memory: 1Gi }
-    limits:   { cpu: "1",  memory: 2Gi }
----
+    requests:
+      cpu: "500m"
+      memory: 1Gi
+    limits:
+      cpu: "1"
+      memory: 2Gi
+  etcVolumeStorageConfig:
+    storageClassName: local-path
+    storageCapacity: 10Gi
+  varVolumeStorageConfig:
+    storageClassName: local-path
+    storageCapacity: 20Gi
+​
+5.4 Cluster Manager — 01-cluster-manager.yaml
 apiVersion: enterprise.splunk.com/v4
 kind: ClusterManager
 metadata:
   name: cm
-  namespace: splunk-operator
+  namespace: splunk
   finalizers:
-  - enterprise.splunk.com/delete-pvc
+    - enterprise.splunk.com/delete-pvc
 spec:
+  image: splunk/splunk:10.6.0
+  imagePullPolicy: IfNotPresent
+  licenseManagerRef:
+    name: lm
   monitoringConsoleRef:
     name: mc
-  etcVolumeStorageConfig: { storageClassName: local-path, storageCapacity: 10Gi }
-  varVolumeStorageConfig: { storageClassName: local-path, storageCapacity: 30Gi }
+  # Single-line form: immune to copy/paste indentation damage
+  defaults: "splunk:\n  idxc:\n    replication_factor: 3\n    search_factor: 2\n"
   resources:
-    requests: { cpu: 500m, memory: 1Gi }
-    limits:   { cpu: "2",  memory: 3Gi }
-  defaults: |-
-    splunk:
-      conf:
-        - key: server
-          value:
-            directory: /opt/splunk/etc/system/local
-            content:
-              clustering:
-                replication_factor: 2
-                search_factor: 2
-EOF
-kubectl apply -f 01-mc-cm.yaml
-kubectl -n splunk-operator get pods -w
-```
-
-Wacht tot `splunk-mc-monitoring-console-0` en `splunk-cm-cluster-manager-0` op `1/1 Running` staan (eerste keer 3–6 minuten). Controleer de fase:
-
-```bash
-kubectl -n splunk-operator get clustermanager cm
-# NAME   PHASE   ...
-# cm     Ready
-```
-
-> Replication factor en search factor staan op 2 (in plaats van de Splunk-standaard 3 op 3 peers) om schijfgebruik en I/O op één fysieke disk te beperken. Alle drie de indexers staan toch op dezelfde disk, dus redundantie is hier vooral functioneel (clustergedrag oefenen), niet voor dataveiligheid.
-
-### 6.3 IndexerCluster (3 peers)
-
-```bash
-cat > 02-idx.yaml <<'EOF'
+    requests:
+      cpu: "1"
+      memory: 2Gi
+    limits:
+      cpu: "2"
+      memory: 4Gi
+  etcVolumeStorageConfig:
+    storageClassName: local-path
+    storageCapacity: 10Gi
+  varVolumeStorageConfig:
+    storageClassName: local-path
+    storageCapacity: 50Gi
+​
+5.5 Indexer cluster (3 peers) — 02-indexer-cluster.yaml
 apiVersion: enterprise.splunk.com/v4
 kind: IndexerCluster
 metadata:
-  name: idx
-  namespace: splunk-operator
+  name: idxc
+  namespace: splunk
   finalizers:
-  - enterprise.splunk.com/delete-pvc
+    - enterprise.splunk.com/delete-pvc
 spec:
   replicas: 3
+  image: splunk/splunk:10.6.0
+  imagePullPolicy: IfNotPresent
   clusterManagerRef:
     name: cm
+  licenseManagerRef:
+    name: lm
   monitoringConsoleRef:
     name: mc
-  etcVolumeStorageConfig: { storageClassName: local-path, storageCapacity: 10Gi }
-  varVolumeStorageConfig: { storageClassName: local-path, storageCapacity: 600Gi }
   resources:
-    requests: { cpu: "1", memory: 4Gi }
-    limits:   { cpu: "4", memory: 8Gi }
-  # HEC/S2S via NodePort bereikbaar maken (optioneel)
-  serviceTemplate:
-    spec:
-      type: NodePort
-EOF
-kubectl apply -f 02-idx.yaml
-kubectl -n splunk-operator get pods -l app.kubernetes.io/instance=splunk-idx-indexer -w
-```
-
-Wacht op `splunk-idx-indexer-0/1/2` Running en:
-
-```bash
-kubectl -n splunk-operator get indexercluster idx
-# NAME   PHASE   MANAGER   DESIRED   READY   ...
-# idx    Ready   Ready     3         3
-```
-
-### 6.4 Search head (Standalone, gekoppeld aan de indexer-cluster)
-
-Eén `Standalone`-instance met `clusterManagerRef` wordt door de operator automatisch als search head aan de indexer-cluster gekoppeld. Dit is de lichtste search-laag (~4 Gi RAM) en op een single node functioneel gelijkwaardig aan een SearchHeadCluster.
-
-```bash
-cat > 03-sh.yaml <<'EOF'
+    requests:
+      cpu: "2"
+      memory: 6Gi
+    limits:
+      cpu: "4"
+      memory: 10Gi
+  etcVolumeStorageConfig:
+    storageClassName: local-path
+    storageCapacity: 10Gi
+  varVolumeStorageConfig:
+    storageClassName: local-path
+    storageCapacity: 900Gi
+​
+5.6 Two separate search heads — 03-search-heads.yaml
+Each search head is a Standalone instance with clusterManagerRef, which makes it a search head of the indexer cluster.
 apiVersion: enterprise.splunk.com/v4
 kind: Standalone
 metadata:
-  name: sh
-  namespace: splunk-operator
+  name: sh1
+  namespace: splunk
   finalizers:
-  - enterprise.splunk.com/delete-pvc
+    - enterprise.splunk.com/delete-pvc
 spec:
+  replicas: 1
+  image: splunk/splunk:10.6.0
+  imagePullPolicy: IfNotPresent
   clusterManagerRef:
     name: cm
+  licenseManagerRef:
+    name: lm
   monitoringConsoleRef:
     name: mc
-  etcVolumeStorageConfig: { storageClassName: local-path, storageCapacity: 10Gi }
-  varVolumeStorageConfig: { storageClassName: local-path, storageCapacity: 100Gi }
   resources:
-    requests: { cpu: 500m, memory: 2Gi }
-    limits:   { cpu: "2",  memory: 4Gi }
-EOF
-kubectl apply -f 03-sh.yaml
-kubectl -n splunk-operator get pods -l app.kubernetes.io/instance=splunk-sh-standalone -w
-```
-
-Wacht op `splunk-sh-standalone-0` Running en:
-
-```bash
-kubectl -n splunk-operator get standalone sh
-# NAME   PHASE   DESIRED   READY
-# sh     Ready   1         1
-```
-
-### 6.5 Eindcontrole
-
-```bash
-kubectl -n splunk-operator get pods
-kubectl -n splunk-operator get clustermanager,indexercluster,standalone,monitoringconsole
-kubectl -n splunk-operator get pvc
-kubectl top pods -n splunk-operator      # via rke2-metrics-server
-```
-
-Alle CR's moeten `PHASE: Ready` melden.
-
-### 6.6 Admin-wachtwoord ophalen
-
-De operator genereert de wachtwoorden en zet ze in één namespace-breed secret:
-
-```bash
-kubectl -n splunk-operator get secret splunk-splunk-operator-secret \
-  -o jsonpath='{.data.password}' | base64 -d; echo
-```
-
-(Naamgeving: `splunk-<namespace>-secret`.) Gebruikersnaam is `admin`.
-
+    requests:
+      cpu: "2"
+      memory: 4Gi
+    limits:
+      cpu: "4"
+      memory: 8Gi
+  etcVolumeStorageConfig:
+    storageClassName: local-path
+    storageCapacity: 10Gi
+  varVolumeStorageConfig:
+    storageClassName: local-path
+    storageCapacity: 100Gi
 ---
-
-## 7. Toegang tot Splunk Web
-
-### 7.1 Snel: port-forward
-
-```bash
-kubectl -n splunk-operator port-forward --address 0.0.0.0 svc/splunk-sh-standalone-service 8000:8000
-```
-
-Open http://192.168.1.50:8000 en log in als `admin`.
-
-### 7.2 Blijvend: Ingress via de meegeleverde ingress-nginx
-
-Voeg op je werkstation (of in je lokale DNS) toe:
-
-```
-192.168.1.50  splunk.lan cm.splunk.lan mc.splunk.lan
-```
-
-```bash
-cat > 04-ingress.yaml <<'EOF'
-apiVersion: networking.k8s.io/v1
-kind: Ingress
+apiVersion: enterprise.splunk.com/v4
+kind: Standalone
 metadata:
-  name: splunk-web
-  namespace: splunk-operator
-  annotations:
-    nginx.ingress.kubernetes.io/proxy-body-size: "0"
+  name: sh2
+  namespace: splunk
+  finalizers:
+    - enterprise.splunk.com/delete-pvc
 spec:
-  ingressClassName: nginx
-  rules:
-  - host: splunk.lan
-    http:
-      paths:
-      - path: /
-        pathType: Prefix
-        backend:
-          service:
-            name: splunk-sh-standalone-service
-            port: { number: 8000 }
-  - host: cm.splunk.lan
-    http:
-      paths:
-      - path: /
-        pathType: Prefix
-        backend:
-          service:
-            name: splunk-cm-cluster-manager-service
-            port: { number: 8000 }
-  - host: mc.splunk.lan
-    http:
-      paths:
-      - path: /
-        pathType: Prefix
-        backend:
-          service:
-            name: splunk-mc-monitoring-console-service
-            port: { number: 8000 }
+  replicas: 1
+  image: splunk/splunk:10.6.0
+  imagePullPolicy: IfNotPresent
+  clusterManagerRef:
+    name: cm
+  licenseManagerRef:
+    name: lm
+  monitoringConsoleRef:
+    name: mc
+  resources:
+    requests:
+      cpu: "2"
+      memory: 4Gi
+    limits:
+      cpu: "4"
+      memory: 8Gi
+  etcVolumeStorageConfig:
+    storageClassName: local-path
+    storageCapacity: 10Gi
+  varVolumeStorageConfig:
+    storageClassName: local-path
+    storageCapacity: 100Gi
+​
+5.7 Monitoring Console (optional but recommended) — 04-monitoring-console.yaml
+apiVersion: enterprise.splunk.com/v4
+kind: MonitoringConsole
+metadata:
+  name: mc
+  namespace: splunk
+  finalizers:
+    - enterprise.splunk.com/delete-pvc
+spec:
+  image: splunk/splunk:10.6.0
+  imagePullPolicy: IfNotPresent
+  licenseManagerRef:
+    name: lm
+  resources:
+    requests:
+      cpu: "500m"
+      memory: 2Gi
+    limits:
+      cpu: "2"
+      memory: 4Gi
+  etcVolumeStorageConfig:
+    storageClassName: local-path
+    storageCapacity: 10Gi
+  varVolumeStorageConfig:
+    storageClassName: local-path
+    storageCapacity: 20Gi
+​
+If you skip the Monitoring Console, remove every monitoringConsoleRef block from the files above (including the License Manager).
+5.8 Web access via NodePort — 05-nodeport-services.yaml
+These Services select the operator-created pods by the standard StatefulSet pod-name label, so they do not depend on operator-internal labels.
+apiVersion: v1
+kind: Service
+metadata: { name: web-cm, namespace: splunk }
+spec:
+  type: NodePort
+  selector: { statefulset.kubernetes.io/pod-name: splunk-cm-cluster-manager-0 }
+  ports: [ { name: web, port: 8000, targetPort: 8000, nodePort: 30800 } ]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web-sh1, namespace: splunk }
+spec:
+  type: NodePort
+  selector: { statefulset.kubernetes.io/pod-name: splunk-sh1-standalone-0 }
+  ports: [ { name: web, port: 8000, targetPort: 8000, nodePort: 30801 } ]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web-sh2, namespace: splunk }
+spec:
+  type: NodePort
+  selector: { statefulset.kubernetes.io/pod-name: splunk-sh2-standalone-0 }
+  ports: [ { name: web, port: 8000, targetPort: 8000, nodePort: 30802 } ]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web-mc, namespace: splunk }
+spec:
+  type: NodePort
+  selector: { statefulset.kubernetes.io/pod-name: splunk-mc-monitoring-console-0 }
+  ports: [ { name: web, port: 8000, targetPort: 8000, nodePort: 30803 } ]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web-lm, namespace: splunk }
+spec:
+  type: NodePort
+  selector: { statefulset.kubernetes.io/pod-name: splunk-lm-license-manager-0 }
+  ports: [ { name: web, port: 8000, targetPort: 8000, nodePort: 30804 } ]
+​
+5.9 Apply in order and watch
+cd ~/splunk-k8s
+kubectl apply -f 00-license-manager.yaml
+kubectl -n splunk get licensemanager lm -w          # wait for PHASE Ready, Ctrl-C
+
+kubectl apply -f 01-cluster-manager.yaml
+kubectl -n splunk get clustermanager cm -w          # wait for PHASE Ready (5–10 min first time), Ctrl-C
+
+kubectl apply -f 02-indexer-cluster.yaml
+kubectl -n splunk get indexercluster idxc -w        # wait for Ready, 3/3
+
+kubectl apply -f 03-search-heads.yaml -f 04-monitoring-console.yaml -f 05-nodeport-services.yaml
+kubectl -n splunk get standalone,monitoringconsole -w
+​
+Full status:
+kubectl -n splunk get licensemanager,clustermanager,indexercluster,standalone,monitoringconsole
+kubectl -n splunk get pods -o wide
+kubectl -n splunk get pvc
+kubectl -n splunk get svc
+​
+Expected pods:
+splunk-lm-license-manager-0         1/1 Running
+splunk-cm-cluster-manager-0         1/1 Running
+splunk-idxc-indexer-0               1/1 Running
+splunk-idxc-indexer-1               1/1 Running
+splunk-idxc-indexer-2               1/1 Running
+splunk-sh1-standalone-0             1/1 Running
+splunk-sh2-standalone-0             1/1 Running
+splunk-mc-monitoring-console-0      1/1 Running
+​
+5.10 Verify licensing
+PW=$(kubectl -n splunk get secret splunk-splunk-secret -o jsonpath='{.data.password}' | base64 -d)
+
+echo $PW
+W5R10XvgfiepDlK4Cv544rxt
+
+
+# Licence installed on the License Manager
+kubectl -n splunk exec splunk-lm-license-manager-0 -- \
+  /opt/splunk/bin/splunk list licenses -auth "admin:${PW}"
+
+# Every other instance must be a licence peer of the LM
+for p in splunk-cm-cluster-manager-0 splunk-idxc-indexer-0 splunk-sh1-standalone-0 splunk-sh2-standalone-0; do
+  echo "==$p"
+  kubectl -n splunk exec $p -- /opt/splunk/bin/splunk list licenser-localpeer -auth "admin:${PW}" \
+    | grep -E "manager_uri|master_uri|guid" | head -2
+done
+​
+In the License Manager UI (http://10.10.99.10:30804) → Settings → Licensing: the licence stack shows your licence, and the peer list shows the CM, three indexers, both search heads and the MC.
+Renewing / replacing the licence (e.g. a Developer License after 6 months):
+kubectl -n splunk create configmap splunk-licenses --from-file=enterprise.lic=./new.lic \
+  --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n splunk delete pod splunk-lm-license-manager-0      # LM restarts and loads the new file
+​
+6. Deploy the Universal Forwarder container
+SOK 3.2.0 introduced a dedicated Universal Forwarder Helm chart (stateless by default, Deployment-only). The UF is not a SOK custom resource; the operator’s CRDs do not support the forwarder image, so the Helm chart is the supported route.
+6.1 Get the chart from the 3.2.0 release
+cd ~/splunk-k8s
+git clone --branch 3.2.0 --depth 1 https://github.com/splunk/splunk-operator.git sok-src
+ls sok-src/helm-chart/splunk-universalforwarder
+​
+6.2 Values file — uf-values.yaml
+Replace <UF_ADMIN_PASSWORD> with a strong password (the chart refuses changeme).
+image:
+  repository: docker.io/splunk/universalforwarder
+  tag: "10.6.0"            # chart default is 10.4.0; UF 10.6 is certified with Splunk 10.6
+  pullPolicy: IfNotPresent
+
+replicaCount: 1
+
+splunkConfig:
+  password: "W5R10XvgfiepDlK4Cv544rxt"
+  # Read the Splunk General Terms first; this value records your acceptance
+  splunkGeneralTerms: "--accept-sgt-current-at-splunk-com"
+  # Required by chart validation; the full load-balanced list is in conf.outputs below
+  forwardServers:
+    - splunk-idxc-indexer-0.splunk-idxc-indexer-headless.splunk.svc.cluster.local:9997
+  # Inputs created at start-up (comma-joined into SPLUNK_ADD)
+  add:
+    - "udp 514"
+
+conf:
+  outputs: |
+    [tcpout]
+    defaultGroup = idxc
+
+    [tcpout:idxc]
+    server = splunk-idxc-indexer-0.splunk-idxc-indexer-headless.splunk.svc.cluster.local:9997,splunk-idxc-indexer-1.splunk-idxc-indexer-headless.splunk.svc.cluster.local:9997,splunk-idxc-indexer-2.splunk-idxc-indexer-headless.splunk.svc.cluster.local:9997
+    autoLBFrequency = 30
+    useACK = true
+
+storage:
+  emptyDir: true           # stateless; set false + updateStrategy Recreate for durable fishbucket
+
+service:
+  enabled: true
+  type: ClusterIP
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 1Gi
+    ephemeral-storage: 2Gi
+​
+Pointing the UF at the three indexer pods individually (headless DNS) gives true Splunk auto-load-balancing with indexer acknowledgement. Using the splunk-idxc-indexer-service ClusterIP would also work, but Kubernetes rather than Splunk would decide which indexer receives each connection.
+6.3 Install
+dnf -y install openssl tar
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+echo 'export KUBECONFIG=/etc/rancher/k3s/k3s.yaml' >> ~/.bashrc
+helm install uf ./sok-src/helm-chart/splunk-universalforwarder \
+  --namespace splunk \
+  --values uf-values.yaml
+
+kubectl -n splunk get pods -l app.kubernetes.io/name=splunk-universalforwarder -w
+​
+6.4 (Optional) Receive syslog from the LAN on UDP 30514
+cat > 06-uf-syslog-nodeport.yaml <<'EOF'
+apiVersion: v1
+kind: Service
+metadata: { name: uf-syslog-nodeport, namespace: splunk }
+spec:
+  type: NodePort
+  selector: { app.kubernetes.io/name: splunk-universalforwarder }
+  ports: [ { name: syslog-udp, port: 514, targetPort: 514, protocol: UDP, nodePort: 30514 } ]
 EOF
-kubectl apply -f 04-ingress.yaml
-kubectl -n splunk-operator get ingress
-```
+kubectl apply -f 06-uf-syslog-nodeport.yaml
+​
+6.5 Verify forwarding
+UF_POD=$(kubectl -n splunk get pod -l app.kubernetes.io/name=splunk-universalforwarder -o jsonpath='{.items[0].metadata.name}')
 
-Nu bereikbaar op http://splunk.lan, http://cm.splunk.lan en http://mc.splunk.lan. Wil je TLS, installeer dan cert-manager en voeg een `tls:`-sectie toe.
+kubectl -n splunk exec $UF_POD -- cat /opt/splunkforwarder/etc/system/local/outputs.conf
+kubectl -n splunk exec $UF_POD -- \
+  grep -E "Connected to idx|AutoLoadBalanced" /opt/splunkforwarder/var/log/splunk/splunkd.log | tail -5
 
-### 7.3 Data insturen (HEC)
-
-Met `serviceTemplate.type: NodePort` op de IndexerCluster:
-
-```bash
-kubectl -n splunk-operator get svc splunk-idx-indexer-service
-# Zoek de NodePort die op 8088 (HEC) is gemapt, bijv. 8088:31088
-
-# HEC-token staat in hetzelfde secret
-kubectl -n splunk-operator get secret splunk-splunk-operator-secret -o jsonpath='{.data.hec_token}' | base64 -d; echo
-
-curl -k https://192.168.1.50:31088/services/collector/event \
-  -H "Authorization: Splunk <hec_token>" \
-  -d '{"event": "hello from k8s", "sourcetype": "manual"}'
-```
-
-Zoek in Splunk Web: `index=main sourcetype=manual`.
-
----
-
-## 8. Docker Engine installeren
-
-Docker publiceert geen aparte AlmaLinux-repo; de CentOS-repo (met `$releasever` = 10) werkt voor AlmaLinux 10.
-
-```bash
-dnf -y install dnf-plugins-core
-dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
-dnf -y install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-```
-
-Voordat je Docker start: zorg dat Docker's iptables-regels de Kubernetes-verkeer niet hinderen en dat Docker de `nftables`-backend van EL10 gebruikt. Een minimale daemon-config:
-
-```bash
-mkdir -p /etc/docker
-cat > /etc/docker/daemon.json <<'EOF'
-{
-  "log-driver": "json-file",
-  "log-opts": { "max-size": "50m", "max-file": "3" },
-  "default-address-pools": [
-    { "base": "172.17.0.0/16", "size": 24 }
-  ],
-  "live-restore": true
-}
-EOF
-```
-
-> `default-address-pools` houdt Docker weg van `10.42.0.0/16` en `10.43.0.0/16` (RKE2). Docker's standaardpool `172.17.0.0/16` overlapt hier niet mee.
-
-```bash
-systemctl enable --now docker
-docker version
-docker run --rm hello-world
-```
-
-Niet-root gebruik:
-
-```bash
-usermod -aG docker eric
-# opnieuw inloggen (of: newgrp docker)
-```
-
-Controleer na het starten van Docker dat Kubernetes nog gezond is (Docker voegt iptables/nftables-regels toe, Canal moet daar niet van schrikken):
-
-```bash
-kubectl get pods -A | grep -v Running | grep -v Completed   # verwacht: leeg
-kubectl -n splunk-operator exec splunk-cm-cluster-manager-0 -- curl -s -o /dev/null -w '%{http_code}\n' http://splunk-idx-indexer-0.splunk-idx-indexer-headless:8000   # 200/303
-```
-
----
-
-## 9. Portainer CE installeren
-
-```bash
-docker volume create portainer_data
-
-docker run -d \
-  --name portainer \
-  --restart=always \
-  -p 8000:8000 \
-  -p 9443:9443 \
-  -v /var/run/docker.sock:/var/run/docker.sock \
-  -v portainer_data:/data \
-  portainer/portainer-ce:lts
-
-docker ps --filter name=portainer
-```
-
-> Poort 8000 is alleen nodig voor Portainer Edge-agents; je mag `-p 8000:8000` weglaten. Let op: dit is dezelfde poort als Splunk Web bij een port-forward (§7.1) — gebruik dan een andere lokale poort voor de port-forward (bijv. `8001:8000`), of laat 8000 bij Portainer weg.
-
-Open binnen **5 minuten** na de start https://192.168.1.50:9443 (zelfondertekend certificaat — accepteer de waarschuwing) en maak het admin-account aan. Ben je te laat, dan vergrendelt Portainer zich uit veiligheid; herstart dan de container:
-
-```bash
-docker restart portainer
-```
-
-Na het aanmaken van het account: kies **Get Started** → de lokale Docker-omgeving (`local`) is direct beschikbaar. Vanaf hier beheer je containers, images, volumes, netwerken en Compose-stacks via de browser.
-
-### 9.1 Portainer-updates
-
-```bash
-docker stop portainer && docker rm portainer
-docker pull portainer/portainer-ce:lts
-# herhaal het docker run-commando van hierboven; de data staat in het volume
-```
-
----
-
-## 10. (Optioneel) RKE2-cluster koppelen aan Portainer
-
-Portainer kan ook je Kubernetes-cluster tonen en beheren (namespaces, workloads, logs, shell in pods).
-
-1. In Portainer: **Environments → Add environment → Kubernetes → Start Wizard**.
-2. Kies **Agent** → tab **Kubernetes via node port**.
-3. Portainer toont een `kubectl apply -f https://downloads.portainer.io/...portainer-agent-k8s-nodeport.yaml`-commando. Voer dat uit op de server:
-
-```bash
-kubectl apply -f <de URL uit de wizard>
-kubectl -n portainer get pods    # portainer-agent-xxxx Running
-kubectl -n portainer get svc     # NodePort 30778
-```
-
-4. Terug in de wizard: naam `rke2-splunk`, Environment address `192.168.1.50:30778` → **Connect**.
-
----
-
-## 11. Verificatie-checklist
-
-```bash
-# OS
-getenforce                                  # Enforcing
-systemctl is-active firewalld               # inactive
-swapon --show                               # leeg
-cat /sys/kernel/mm/transparent_hugepage/enabled   # [never]
-
-# RKE2
-systemctl is-active rke2-server             # active
-kubectl get nodes                           # Ready
-kubectl get pods -A | grep -vE 'Running|Completed'   # leeg
-kubectl get storageclass                    # local-path (default)
-
-# Splunk
-kubectl -n splunk-operator get pods         # allemaal 1/1 Running
-kubectl -n splunk-operator get clustermanager,indexercluster,standalone,monitoringconsole
-                                            # allemaal Ready
-kubectl -n splunk-operator exec splunk-cm-cluster-manager-0 -- \
-  /opt/splunk/bin/splunk show cluster-status -auth admin:"$(kubectl -n splunk-operator get secret splunk-splunk-operator-secret -o jsonpath='{.data.password}' | base64 -d)"
-                                            # 3 peers Up, RF/SF met
-
-# Docker / Portainer
-docker info | grep -E 'Server Version|Cgroup|Storage Driver'
-docker ps                                   # portainer Up
-curl -k -s -o /dev/null -w '%{http_code}\n' https://127.0.0.1:9443/   # 200
-```
-
-Functionele test: stuur een event via HEC (§7.3), zoek het op in Splunk Web, en bekijk in de Monitoring Console (mc.splunk.lan → Settings → Monitoring Console → Indexing → Indexer Clustering) of alle peers zichtbaar zijn.
-
----
-
-## 12. Beheer, back-up en upgrades
-
-### 12.1 Dagelijkse commando's
-
-```bash
-kubectl -n splunk-operator logs -f splunk-idx-indexer-0            # Splunk-logs
-kubectl -n splunk-operator exec -it splunk-sh-standalone-0 -- bash
-kubectl -n splunk-operator logs -f deploy/splunk-operator-controller-manager
-journalctl -u rke2-server -f
-crictl ps ; crictl images                                          # RKE2's containerd
-docker ps ; docker images                                          # Docker
-```
-
-### 12.2 Splunk netjes stoppen/starten (bijv. voor onderhoud)
-
-De operator beheert StatefulSets; schaal niet handmatig. Wil je de hele node herstarten: `reboot` volstaat — RKE2 en Docker starten automatisch, en de operator brengt Splunk terug in de laatste staat. Volgorde bij herstart: CM → indexers → SH; even geduld (5–10 min).
-
-### 12.3 Back-up
-
-- **etcd (RKE2):** automatische snapshots elke 12 uur in `/var/lib/rancher/rke2/server/db/snapshots/`. Handmatig: `rke2 etcd-snapshot save`.
-- **Splunk-data:** staat in `/opt/local-path-provisioner/pvc-*_splunk-operator_*`. Maak een filesystem-back-up (rsync/borg/restic) naar een externe schijf of NAS. Voor consistente back-ups: gebruik Splunk's eigen mechanismen (frozen buckets naar een archiefpad, of SmartStore naar S3-compatibele storage zoals MinIO).
-- **Manifesten:** bewaar `~/splunk/*.yaml` in git.
-- **Portainer:** `docker run --rm -v portainer_data:/data -v $PWD:/backup busybox tar czf /backup/portainer_data.tgz /data` (of Settings → Backup in de UI).
-
-### 12.4 Upgrades
-
-| Wat | Hoe |
-|---|---|
-| AlmaLinux | `dnf update && reboot` (RKE2/Docker starten vanzelf) |
-| RKE2 patch-release | `curl -sfL https://get.rke2.io \| INSTALL_RKE2_CHANNEL=v1.34 sh -` en `systemctl restart rke2-server` |
-| RKE2 minor (bijv. 1.35) | **Eerst** controleren of de Splunk Operator die K8s-versie ondersteunt (ChangeLog) |
-| Splunk Operator | Nieuwe manifest downloaden, dezelfde twee `sed`-aanpassingen doen, `kubectl apply --server-side`; de operator rolt de Splunk-pods vervolgens in de juiste volgorde (CM → indexers → SH) door |
-| Splunk Enterprise | `RELATED_IMAGE_SPLUNK_ENTERPRISE` in het operator-deployment aanpassen, of per CR `spec.image` zetten |
-| Docker | `dnf update docker-ce` |
-| Portainer | §9.1 |
-
-Splunk Operator: lees vóór elke upgrade de upgrade-notities op https://splunk.github.io/splunk-operator/ChangeLog.html; grote sprongen (bijv. 2.x → 3.x) vragen extra stappen.
-
----
-
-## 13. Troubleshooting
-
-| Symptoom | Oorzaak / oplossing |
-|---|---|
-| `rke2-server` start niet, log meldt iets over `firewalld` of CNI-routes | Firewalld nog actief of NetworkManager beheert `cali*`-interfaces → §2.3 / §2.4, daarna `reboot` |
-| Pods blijven `ContainerCreating` met SELinux-denials (`ausearch -m avc -ts recent`) | `rke2-selinux` ontbreekt (tarball-install?) → `dnf install rke2-selinux`, of context van `/opt/local-path-provisioner` niet gezet → §4 |
-| PVC blijft `Pending` | Geen default StorageClass, of local-path-provisioner niet Running → `kubectl -n local-path-storage get pods` |
-| Splunk-pod crasht direct, log: *"You must accept the Splunk General Terms"* | `SPLUNK_GENERAL_TERMS` niet gezet in het operator-deployment → §5.1, daarna `kubectl -n splunk-operator rollout restart deploy/splunk-operator-controller-manager` en de Splunk-pods verwijderen zodat ze opnieuw starten |
-| Splunk-pod `OOMKilled` | Verhoog `resources.limits.memory` in het CR (indexers hebben bij zwaar zoekwerk >8 Gi nodig); er is ~10 GB marge (§0.2) |
-| IndexerCluster blijft in `Pending`/`ScalingUp` | Cluster Manager nog niet `Ready`; check `kubectl -n splunk-operator logs splunk-cm-cluster-manager-0` en of `replication_factor` ≤ aantal peers |
-| Standalone search head ziet de indexers niet | `clusterManagerRef` moet naar een `Ready` ClusterManager wijzen; check `kubectl -n splunk-operator logs splunk-sh-standalone-0` en in Splunk Web: Settings → Distributed search |
-| Splunk Web via ingress geeft 502/504 | Service-naam of poort klopt niet: `kubectl -n splunk-operator get svc` |
-| Portainer: *"Your Portainer instance timed out for security purposes"* | `docker restart portainer` en binnen 5 min het admin-account aanmaken |
-| Na starten van Docker: pods kunnen elkaar/DNS niet bereiken | Docker heeft `FORWARD`-policy op DROP gezet. Fix: `iptables -P FORWARD ACCEPT` en permanent: `"iptables": true` laten staan maar in `/etc/systemd/system/docker.service.d/override.conf` een `ExecStartPost=/usr/sbin/iptables -P FORWARD ACCEPT` toevoegen; of `"ip-forward-no-drop": true` in `daemon.json` (Docker ≥ 28) |
-| Schijf vol | `crictl rmi --prune` (RKE2-images), `docker system prune`, en controleer `du -sh /opt/local-path-provisioner/*`. Splunk: verlaag `maxTotalDataSizeMB` per index of zet `frozenTimePeriodInSecs` |
-| Node `NotReady` na reboot | `journalctl -u rke2-server -b` ; meestal wachten (etcd + containerd herstart) of THP/sysctl niet toegepast |
-
-Handige diagnose-commando's:
-
-```bash
-kubectl describe pod -n splunk-operator <pod>          # events onderaan
-kubectl get events -n splunk-operator --sort-by=.lastTimestamp | tail -30
-kubectl -n splunk-operator get <kind> <naam> -o yaml | yq '.status'
-rke2 --version ; crictl info | head -40
-```
-
----
-
-## Bronnen
-
-- AlmaLinux 10: https://almalinux.org/get-almalinux/ en https://wiki.almalinux.org/release-notes/
-- RKE2 requirements: https://docs.rke2.io/install/requirements
-- RKE2 quickstart en configuratie: https://docs.rke2.io/install/quickstart , https://docs.rke2.io/install/configuration
-- RKE2 known issues (firewalld, NetworkManager): https://docs.rke2.io/known_issues
-- RKE2 SELinux: https://docs.rke2.io/security/selinux
-- RKE2 releases: https://github.com/rancher/rke2/releases
-- local-path-provisioner: https://github.com/rancher/local-path-provisioner
-- Splunk Operator (home): https://splunk.github.io/splunk-operator/
-- Splunk Operator install: https://splunk.github.io/splunk-operator/Install.html
-- Splunk Operator examples (CR-voorbeelden): https://splunk.github.io/splunk-operator/Examples.html
-- Splunk Operator custom resources: https://splunk.github.io/splunk-operator/CustomResources.html
-- Splunk Operator storage guidance: https://splunk.github.io/splunk-operator/StorageClass.html
-- Splunk Operator 3.1.0 release notes (K8s/Splunk-compatibiliteit): https://github.com/splunk/splunk-operator/releases/tag/3.1.0
-- Splunk Operator ChangeLog: https://splunk.github.io/splunk-operator/ChangeLog.html
-- Splunk Enterprise image tags: https://hub.docker.com/r/splunk/splunk/tags
-- Docker op AlmaLinux 10: https://linuxiac.com/how-to-install-docker-on-almalinux-10/ en https://docs.docker.com/engine/install/centos/
-- Portainer CE installatie: https://docs.portainer.io/start/install-ce/server/docker/linux
-- Portainer Kubernetes-agent: https://docs.portainer.io/admin/environments/add/kubernetes/agent
+# Send a test syslog event to the UF from inside the cluster
+UF_SVC=$(kubectl -n splunk get svc -l app.kubernetes.io/name=splunk-universalforwarder \
+  -o jsonpath='{.items[0].metadata.name}')
+kubectl -n splunk run sendlog --rm -it --restart=Never --image=busybox:1.36.1 -- \
+  sh -c "echo '<14>hello from busybox via UF' | nc -u -w1${UF_SVC} 514"
+​
+7. Access and verification
+7.1 Admin password
+kubectl -n splunk get secret splunk-splunk-secret -o jsonpath='{.data.password}' | base64 -d; echo
+​
+User: admin. The same password is valid on the LM, CM, indexers, both search heads and the MC.
+7.2 Web UIs
+Component
+URL
+Cluster Manager
+http://10.10.99.10:30800
+Search head 1
+http://10.10.99.10:30801
+Search head 2
+http://10.10.99.10:30802
+Monitoring Console
+http://10.10.99.10:30803
+License Manager
+http://10.10.99.10:30804
+Alternative without NodePorts (from a workstation with kubeconfig):
+kubectl -n splunk port-forward svc/splunk-sh1-standalone-service 8000:8000
+​
+7.3 Indexer cluster health
+PW=$(kubectl -n splunk get secret splunk-splunk-secret -o jsonpath='{.data.password}' | base64 -d)
+kubectl -n splunk exec splunk-cm-cluster-manager-0 -- \
+  /opt/splunk/bin/splunk show cluster-status --verbose -auth "admin:${PW}"
+​
+Expect 3 peers Up, Replication factor met and Search factor met.
+In the Cluster Manager UI: Settings → Indexer Clustering → three peers, and both search heads listed on the Search Heads tab.
+7.4 End-to-end search
+On sh1 and on sh2 run:
+index=main source="udp:514" "hello from busybox"
+​
+and
+| tstats count where index=_internal by splunk_server
+​
+The second search should return all three indexer pods (splunk-idxc-indexer-0/1/2), proving both search heads are distributed across the cluster.
+7.5 Versions sanity check
+kubectl -n splunk exec splunk-sh1-standalone-0 -- /opt/splunk/bin/splunk version
+kubectl -n splunk exec $UF_POD -- /opt/splunkforwarder/bin/splunk version
+kubectl version
+​
+8. Operations: scale, upgrade, tear down
+Scale indexers (watch RAM: each peer requests 6 Gi):
+kubectl -n splunk patch indexercluster idxc --type merge -p '{"spec":{"replicas":4}}'
+​
+Remember to add the new peer to conf.outputs in uf-values.yaml and run helm upgrade uf ... --values uf-values.yaml.
+Deploy apps / indexes to the indexer cluster: use the SOK App Framework (S3-compatible storage, e.g. MinIO) or place apps in manager-apps on the CM and push the bundle.
+Upgrade Splunk (e.g. to a later 10.6.0.x tag): change spec.image in each CR (LM first, then CM, then indexers, then search heads and MC) and re-apply; SOK handles the rolling order.
+Upgrade the UF:
+helm upgrade uf ./sok-src/helm-chart/splunk-universalforwarder -n splunk \
+  --values uf-values.yaml --set image.tag=<new-tag>
+​
+Tear down (the delete-pvc finalizer removes the data volumes — this destroys all indexed data):
+helm uninstall uf -n splunk
+kubectl -n splunk delete -f 05-nodeport-services.yaml -f 04-monitoring-console.yaml \
+  -f 03-search-heads.yaml -f 02-indexer-cluster.yaml -f 01-cluster-manager.yaml \
+  -f 00-license-manager.yaml
+kubectl -n splunk delete configmap splunk-licenses
+kubectl delete namespace splunk
+kubectl delete -f splunk-operator-cluster.yaml
+# Remove K3s completely:
+sudo /usr/local/bin/k3s-uninstall.sh
+​
+9. Troubleshooting
+Symptom
+Check / fix
+Splunk pods exit immediately, logs mention licence/terms
+SPLUNK_GENERAL_TERMS not set on the operator (§4.2): kubectl -n splunk-operator get deploy splunk-operator-controller-manager -o yaml \| grep -A1 SPLUNK_GENERAL_TERMS
+lm stays in Error / licence not loaded
+kubectl -n splunk logs splunk-lm-license-manager-0 \| grep -i licen; check the file is mounted: kubectl -n splunk exec splunk-lm-license-manager-0 -- ls -l /mnt/licenses/; licenseUrl must match the ConfigMap key; licence must not be expired
+Peers show licence warnings / not connected to LM
+licenseManagerRef: { name: lm } missing in a CR; re-apply it. Check §5.10 output
+Pods stuck Pending
+kubectl -n splunk describe pod <pod> → usually Insufficient memory/cpu; reduce requests or replicas. kubectl describe node splunk-k3s shows allocations.
+Pods stuck ContainerCreating for a long time
+First pull of the ~2–3 GB Splunk image; see §3.5. Docker Hub rate limits: kubectl -n splunk get events --sort-by=.lastTimestamp
+CR phase stays Error
+kubectl -n splunk describe <kind> <name> (3.2.0 adds standard status conditions incl. TerminalFailure) and kubectl -n splunk-operator logs deploy/splunk-operator-controller-manager
+Ansible start-up errors inside a Splunk pod
+kubectl -n splunk logs splunk-idxc-indexer-0 (splunk-ansible output)
+SELinux denials (volumes not writable)
+sudo ausearch -m avc -ts recent; confirm k3s-selinux is installed (rpm -q k3s-selinux) and selinux: true is set in K3s config
+Search heads see no peers
+kubectl -n splunk exec splunk-sh1-standalone-0 -- /opt/splunk/bin/splunk list search-server -auth admin:$PW; confirm clusterManagerRef is set
+UF not forwarding
+outputs.conf content and splunkd.log (§6.5); test DNS: kubectl -n splunk run t --rm -it --image=busybox:1.36.1 --restart=Never -- nslookup splunk-idxc-indexer-0.splunk-idxc-indexer-headless.splunk.svc.cluster.local
+NodePort unreachable from LAN
+sudo firewall-cmd --list-ports; kubectl -n splunk get endpoints web-sh1 must list the pod IP
+Disk filling up
+df -h /var/lib/rancher; sudo du -sh /var/lib/rancher/k3s/storage/*; tune index retention (maxTotalDataSizeMB, frozenTimePeriodInSecs) via a CM app bundle
+10. References
+SOK change log (3.2.0 supported versions): https://splunk.github.io/splunk-operator/reference/ChangeLog.html
+SOK installation (General Terms acceptance, manifests): https://splunk.github.io/splunk-operator/deploy/Install.html
+SOK Universal Forwarder Helm chart: https://splunk.github.io/splunk-operator/deploy/uf-helm-chart.html
+SOK custom resources and examples: https://splunk.github.io/splunk-operator/docs/CustomResources.html , https://splunk.github.io/splunk-operator/docs/Examples.html
+SOK guide on Splunk Docs (3.2): https://help.splunk.com/en/splunk-enterprise/splunk-operator-for-kubernetes-guide/3.2
+Splunk Enterprise 10.6 release notes: https://help.splunk.com/en/splunk-enterprise/release-notes-and-updates/release-notes/10.6
+AlmaLinux 10.2 release notes: https://wiki.almalinux.org/release-notes/10.2.html
+K3s v1.36 release notes: https://docs.k3s.io/release-notes/v1.36.X
+K3s requirements and SELinux: https://docs.k3s.io/installation/requirements , https://docs.k3s.io/advanced#selinux-support
+Splunk General Terms: https://www.splunk.com/en_us/legal/splunk-general-terms.html
