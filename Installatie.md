@@ -28,7 +28,7 @@
 6. [Deploy the Splunk 10.6 environment](about:blank#5-deploy-the-splunk-106-environment)
 7. [Deploy the Universal Forwarder container](about:blank#6-deploy-the-universal-forwarder-container)
 8. [Access and verification](about:blank#7-access-and-verification)
-9. [Operations: scale, upgrade, tear down](about:blank#8-operations-scale-upgrade-tear-down)
+9. [Operations: scale, upgrade, uninstall](about:blank#8-operations-scale-upgrade-tear-down)
 10. [Troubleshooting](about:blank#9-troubleshooting)
 11. [References](about:blank#10-references)
 
@@ -725,7 +725,7 @@ for p in splunk-cm-cluster-manager-0 splunk-idxc-indexer-0 splunk-sh1-standalone
 done
 ```
 
-In the License Manager UI (`http://10.10.99.10:30804`) → **Settings → Licensing**: the licence stack shows your licence, and the peer list shows the CM, three indexers, both search heads and the MC.
+In the License Manager UI (`http://192.168.1.50:30804`) → **Settings → Licensing**: the licence stack shows your licence, and the peer list shows the CM, three indexers, both search heads and the MC.
 
 **Renewing / replacing the licence** (e.g. a Developer License after 6 months):
 
@@ -762,7 +762,7 @@ image:
 replicaCount: 1
 
 splunkConfig:
-  password: "W5R10XvgfiepDlK4Cv544rxt"
+  password: "<UF_ADMIN_PASSWORD>"
   # Read the Splunk General Terms first; this value records your acceptance
   splunkGeneralTerms: "--accept-sgt-current-at-splunk-com"
   # Required by chart validation; the full load-balanced list is in conf.outputs below
@@ -862,11 +862,11 @@ User: `admin`. The same password is valid on the LM, CM, indexers, both search h
 
 | Component | URL |
 | --- | --- |
-| Cluster Manager | `http://10.10.99.10:30800` |
-| Search head 1 | `http://10.10.99.10:30801` |
-| Search head 2 | `http://10.10.99.10:30802` |
-| Monitoring Console | `http://10.10.99.10:30803` |
-| License Manager | `http://10.10.99.10:30804` |
+| Cluster Manager | `http://192.168.1.50:30800` |
+| Search head 1 | `http://192.168.1.50:30801` |
+| Search head 2 | `http://192.168.1.50:30802` |
+| Monitoring Console | `http://192.168.1.50:30803` |
+| License Manager | `http://192.168.1.50:30804` |
 
 Alternative without NodePorts (from a workstation with kubeconfig):
 
@@ -912,7 +912,7 @@ kubectl version
 
 ---
 
-## 8. Operations: scale, upgrade, tear down
+## 8. Operations: scale, upgrade, uninstall
 
 **Scale indexers** (watch RAM: each peer requests 6 Gi):
 
@@ -933,7 +933,7 @@ helm upgrade uf ./sok-src/helm-chart/splunk-universalforwarder -n splunk \
   --values uf-values.yaml --set image.tag=<new-tag>
 ```
 
-**Tear down** (the `delete-pvc` finalizer removes the data volumes — **this destroys all indexed data**):
+**Uninstall** (the `delete-pvc` finalizer removes the data volumes — **this destroys all indexed data**):
 
 ```bash
 helm uninstall uf -n splunk
