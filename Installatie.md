@@ -708,8 +708,10 @@ splunk-mc-monitoring-console-0      1/1 Running
 ```bash
 PW=$(kubectl -n splunk get secret splunk-splunk-secret -o jsonpath='{.data.password}' | base64 -d)
 
+# The above command stores the automatically generated admin password in an environment variable.
+# You might want to run 'echo $PW' and store the password somewhere in a safe place
 echo $PW
-W5R10XvgfiepDlK4Cv544rxt
+
 
 # Licence installed on the License Manager
 kubectl -n splunk exec splunk-lm-license-manager-0 -- \
